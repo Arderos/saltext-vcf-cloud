@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 (2026-08-13)
+
+### Added
+
+- Allow profiles and map entries to attach vCenter tags by category and name to newly
+  created VMs and templates. Providers can optionally create missing categories and
+  tags with configurable new-category cardinality.
+
 ## 0.1.0 (2026-08-12)
 
 ### Added

@@ -1,1 +1,0 @@
-Allow profiles and map entries to attach vCenter tags by category and name to newly created VMs and templates. Providers can optionally create missing categories and tags with configurable new-category cardinality.
