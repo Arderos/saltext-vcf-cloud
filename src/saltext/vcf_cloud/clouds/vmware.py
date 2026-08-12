@@ -208,12 +208,12 @@ def _memory_mb(value):
         return None
     if isinstance(value, (int, float)):
         return int(value)
-    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([mMgG][bB])?\s*", str(value))
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([mMgG](?:[bB])?)?\s*", str(value))
     if not match:
         raise SaltCloudSystemExit(f"Invalid memory value: {value!r}")
     amount = float(match.group(1))
-    unit = (match.group(2) or "MB").lower()
-    return int(amount * 1024 if unit == "gb" else amount)
+    unit = (match.group(2) or "MB").lower().rstrip("b")
+    return int(amount * 1024 if unit == "g" else amount)
 
 
 def _list_value(value):
@@ -227,8 +227,22 @@ def _list_value(value):
 def _network_target(name, switch_type=None):
     networks = _objects(vim.Network)
     distributed = _objects(vim.dvs.DistributedVirtualPortgroup)
-    requested_distributed = str(switch_type or "").lower() == "distributed"
-    candidates = distributed if requested_distributed else networks + distributed
+    requested_type = str(switch_type or "").strip().lower()
+    if requested_type not in ("", "standard", "distributed"):
+        raise SaltCloudSystemExit(
+            f"Invalid switch_type {switch_type!r}; expected 'standard' or 'distributed'"
+        )
+    standard = [
+        network
+        for network in networks
+        if not isinstance(network, vim.dvs.DistributedVirtualPortgroup)
+    ]
+    if requested_type == "distributed":
+        candidates = distributed
+    elif requested_type == "standard":
+        candidates = standard
+    else:
+        candidates = standard + distributed
     candidates = {
         network._moId: network for network in candidates  # pylint: disable=protected-access
     }.values()
@@ -262,12 +276,51 @@ def _match_by_label(items, label):
     return next((item for item in items if item["label"].casefold() == wanted), None)
 
 
+_NIC_DEVICE_TYPES = {
+    "vmxnet3": "vim.vm.device.VirtualVmxnet3",
+    "vmxnet2": "vim.vm.device.VirtualVmxnet2",
+    "e1000": "vim.vm.device.VirtualE1000",
+    "e1000e": "vim.vm.device.VirtualE1000e",
+    "pcnet32": "vim.vm.device.VirtualPCNet32",
+    "sriov": "vim.vm.device.VirtualSriovEthernetCard",
+}
+
+
+def _validate_existing_nic(label, current, settings):
+    requested_type = settings.get("adapter_type")
+    if requested_type:
+        expected_type = _NIC_DEVICE_TYPES.get(str(requested_type).lower())
+        if expected_type is None:
+            raise SaltCloudSystemExit(f"Unknown NIC adapter_type {requested_type!r}")
+        if str(current.get("device_type", "")).casefold() != expected_type.casefold():
+            raise SaltCloudSystemExit(
+                f"NIC {label!r} is {current.get('device_type')!r}; changing an existing "
+                f"NIC to {requested_type!r} is not supported"
+            )
+
+    requested_mac = settings.get("mac")
+    current_mac = current.get("mac_address")
+    if requested_mac and str(requested_mac).casefold() != str(current_mac or "").casefold():
+        raise SaltCloudSystemExit(
+            f"NIC {label!r} has MAC {current_mac!r}; changing an existing NIC MAC is not supported"
+        )
+
+
 def _configure_networks(name, network_devices, timeout):
     for label, settings in (network_devices or {}).items():
         current = _match_by_label(vim_vm_nic.list_(_vcf_opts(), name), label)
         target = _network_target(settings["name"], settings.get("switch_type"))
         if current:
+            _validate_existing_nic(label, current, settings)
             task = vim_vm_nic.update_backing(_vcf_opts(), name, current["key"], **target)
+            _wait_task(task, timeout=timeout)
+            if "start_connected" in settings:
+                start_connected = _as_bool(settings["start_connected"])
+                if current.get("start_connected") != start_connected:
+                    task = vim_vm_nic.set_connected(
+                        _vcf_opts(), name, current["key"], start_connected
+                    )
+                    _wait_task(task, timeout=timeout)
         else:
             task = vim_vm_nic.add(
                 _vcf_opts(),
@@ -277,7 +330,19 @@ def _configure_networks(name, network_devices, timeout):
                 start_connected=_as_bool(settings.get("start_connected", True)),
                 **target,
             )
-        _wait_task(task, timeout=timeout)
+            _wait_task(task, timeout=timeout)
+
+
+def _disk_size_gb(value):
+    try:
+        size = float(value)
+    except (TypeError, ValueError) as exc:
+        raise SaltCloudSystemExit(f"Invalid disk size: {value!r}") from exc
+    if size <= 0 or not size.is_integer():
+        raise SaltCloudSystemExit(
+            f"Invalid disk size {value!r}; size must be a positive whole number of GB"
+        )
+    return int(size)
 
 
 def _configure_disks(name, disk_devices, timeout):
@@ -288,7 +353,7 @@ def _configure_disks(name, disk_devices, timeout):
             if requested_size is None:
                 continue
             current_size = current["capacity_bytes"] / (1024**3)
-            requested_size = float(requested_size)
+            requested_size = _disk_size_gb(requested_size)
             if requested_size < current_size:
                 raise SaltCloudSystemExit(
                     f"Disk {label!r} cannot shrink from {current_size:g}GB "
@@ -301,6 +366,7 @@ def _configure_disks(name, disk_devices, timeout):
 
         if requested_size is None:
             raise SaltCloudSystemExit(f"New disk {label!r} requires a size")
+        requested_size = _disk_size_gb(requested_size)
         task = vim_vm_disk.add(
             _vcf_opts(),
             name,
@@ -369,7 +435,7 @@ def _customization_nics(network_devices):
 
 
 def _apply_customization(name, vm_, network_devices, timeout):
-    customization = _cfg("customization", vm_, default=True, search_global=False)
+    customization = _as_bool(_cfg("customization", vm_, default=True, search_global=False))
     named_spec = _cfg("customization_spec", vm_, default=None, search_global=False)
     if not customization:
         return
@@ -527,6 +593,27 @@ def _fire_event(message, tag, args):
     )
 
 
+def _create_failure(name, vm_, message):
+    """Return a visible create error for a VM that already exists in vCenter."""
+    log.error("%s", message)
+    failure_args = __utils__["cloud.filter_event"](
+        "deploy_failed", vm_, ["name", "profile", "provider", "driver"]
+    )
+    failure_args["error"] = message
+    _fire_event(
+        "failed to deploy instance",
+        f"salt/cloud/{name}/deploy_failed",
+        failure_args,
+    )
+    try:
+        data = show_instance(name, call="action")
+    except Exception:  # pylint: disable=broad-except
+        log.exception("Unable to query VMware VM %s after deployment failure", name)
+        data = {"name": name}
+    data["Error"] = message
+    return data
+
+
 def avail_locations(call=None):
     """Return locations (vSphere placement is configured in profiles)."""
     return {}
@@ -536,7 +623,7 @@ def avail_images(call=None):
     """Return virtual machines marked as templates."""
     templates = {}
     for vm_ref in _objects(vim.VirtualMachine):
-        if vm_ref.config.template:
+        if bool(getattr(getattr(vm_ref, "config", None), "template", False)):
             templates[vm_ref.name] = _instance_data(vm_ref)
     return templates
 
@@ -568,7 +655,7 @@ def list_nodes_full(kwargs=None, call=None):
     return {item["name"]: item for item in _summary_instances()}
 
 
-def list_nodes_select(call=None):
+def list_nodes_select(kwargs=None, call=None):
     """Return the fields selected by ``query.selection``."""
     if call == "action":
         raise SaltCloudSystemExit(
@@ -606,8 +693,9 @@ def start(name, call=None):
     return True
 
 
-def stop(name, soft=False, call=None):
+def stop(name, kwargs=None, call=None):
     """Power off a VM, or request a guest shutdown when ``soft`` is true."""
+    soft = _as_bool((kwargs or {}).get("soft", False))
     if soft:
         return vim_vm_power.shutdown_guest(_vcf_opts(), name)
     task = vim_vm_power.power_off(_vcf_opts(), name)
@@ -645,9 +733,9 @@ def destroy(name, call=None):
         {"name": name},
     )
     if __opts__.get("update_cachedir", False):
-        __utils__["cloud.delete_minion_cachedir"](
-            name, _get_active_provider_name().split(":")[0], __opts__
-        )
+        provider_name = _get_active_provider_name()
+        provider_alias = provider_name.split(":")[0] if provider_name else __virtualname__
+        __utils__["cloud.delete_minion_cachedir"](name, provider_alias, __opts__)
     return True
 
 
@@ -705,6 +793,12 @@ def create(vm_):
     try:
         if source_name:
             source = _vm(source_name)
+            source_is_template = bool(getattr(getattr(source, "config", None), "template", False))
+            if source_is_template and not (cluster or resource_pool):
+                raise SaltCloudSystemExit(
+                    "cluster or resourcepool/resource_pool is required when cloning "
+                    f"from template {source_name!r}"
+                )
             target_folder = folder or source.parent._moId  # pylint: disable=protected-access
             if datastore:
                 target_datastore = datastore
@@ -750,7 +844,8 @@ def create(vm_):
         _reconfigure(name, vm_, timeout)
         _configure_networks(name, devices.get("network"), timeout)
         _configure_disks(name, devices.get("disk"), timeout)
-        _apply_customization(name, vm_, devices.get("network"), timeout)
+        if not template:
+            _apply_customization(name, vm_, devices.get("network"), timeout)
 
         if not template and power_on:
             _wait_task(
@@ -761,16 +856,36 @@ def create(vm_):
         log.exception("Error creating VMware VM %s", name)
         return {"Error": f"Error creating {name}: {exc}"}
 
-    if not template and power_on:
+    if not template and power_on and deploy:
         address = _wait_for_ip(
             name,
             _cfg("wait_for_ip_timeout", vm_, default=20 * 60),
         )
-        if address and deploy:
-            if private_key:
-                vm_["key_filename"] = private_key
-            vm_.setdefault("ssh_host", address)
-            __utils__["cloud.bootstrap"](vm_, __opts__)
+        if not address:
+            return _create_failure(
+                name,
+                vm_,
+                f"VM {name!r} was created, but no IPv4 address was found before "
+                "wait_for_ip_timeout; Salt bootstrap was not run",
+            )
+        if private_key:
+            vm_["key_filename"] = private_key
+        vm_.setdefault("ssh_host", address)
+        try:
+            bootstrap_result = __utils__["cloud.bootstrap"](vm_, __opts__)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.exception("Salt bootstrap raised an exception for VMware VM %s", name)
+            return _create_failure(name, vm_, f"Salt bootstrap failed for {name!r}: {exc}")
+        if bootstrap_result is False:
+            return _create_failure(name, vm_, f"Salt bootstrap failed for {name!r}")
+        if isinstance(bootstrap_result, dict):
+            bootstrap_error = bootstrap_result.get("Error") or bootstrap_result.get("Errors")
+            if bootstrap_error:
+                return _create_failure(
+                    name,
+                    vm_,
+                    f"Salt bootstrap failed for {name!r}: {bootstrap_error!r}",
+                )
 
     data = show_instance(name, call="action")
 

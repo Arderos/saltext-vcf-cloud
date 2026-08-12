@@ -72,7 +72,15 @@ def test_as_bool(value, expected):
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [(None, None), (4096, 4096), ("512MB", 512), ("1.5 GB", 1536), ("2048", 2048)],
+    [
+        (None, None),
+        (4096, 4096),
+        ("512MB", 512),
+        ("512M", 512),
+        ("1.5 GB", 1536),
+        ("8G", 8192),
+        ("2048", 2048),
+    ],
 )
 def test_memory_mb(value, expected):
     assert cloud._memory_mb(value) == expected
@@ -161,6 +169,103 @@ def test_find_object_rejects_ambiguous_name(monkeypatch):
         cloud._find_object(SimpleNamespace, "duplicate")
 
 
+def test_network_target_enforces_standard_switch_type(monkeypatch):
+    class StandardNetwork:
+        pass
+
+    class DistributedPortgroup:
+        pass
+
+    standard = StandardNetwork()
+    standard.name = "shared-name"
+    setattr(standard, "_moId", "network-10")
+    distributed = DistributedPortgroup()
+    distributed.name = "shared-name"
+    setattr(distributed, "_moId", "dvportgroup-20")
+    distributed.key = "dvportgroup-key"
+    distributed.config = SimpleNamespace(distributedVirtualSwitch=SimpleNamespace(uuid="dvs-uuid"))
+    fake_vim = SimpleNamespace(
+        Network=StandardNetwork,
+        dvs=SimpleNamespace(DistributedVirtualPortgroup=DistributedPortgroup),
+    )
+    monkeypatch.setattr(cloud, "vim", fake_vim)
+    monkeypatch.setattr(
+        cloud,
+        "_objects",
+        lambda vim_type: [standard, distributed] if vim_type is StandardNetwork else [distributed],
+    )
+
+    assert cloud._network_target("shared-name", "standard") == {"network_moid": "network-10"}
+
+
+def test_configure_networks_updates_existing_nic_connection_state(monkeypatch):
+    current = {
+        "key": 4000,
+        "label": "Network adapter 1",
+        "device_type": "vim.vm.device.VirtualVmxnet3",
+        "mac_address": "00:50:56:aa:bb:cc",
+        "start_connected": True,
+    }
+    update_backing = MagicMock(return_value="task-backing")
+    set_connected = MagicMock(return_value="task-connected")
+    wait = MagicMock()
+    monkeypatch.setattr(cloud, "_vcf_opts", lambda: {"connection": "opts"})
+    monkeypatch.setattr(cloud.vim_vm_nic, "list_", lambda *args: [current])
+    monkeypatch.setattr(cloud.vim_vm_nic, "update_backing", update_backing)
+    monkeypatch.setattr(cloud.vim_vm_nic, "set_connected", set_connected)
+    monkeypatch.setattr(cloud, "_network_target", lambda *args: {"network_moid": "n-1"})
+    monkeypatch.setattr(cloud, "_wait_task", wait)
+
+    cloud._configure_networks(
+        "vm-01",
+        {
+            "Network adapter 1": {
+                "name": "server-vlan",
+                "adapter_type": "vmxnet3",
+                "mac": "00:50:56:AA:BB:CC",
+                "start_connected": "false",
+            }
+        },
+        timeout=30,
+    )
+
+    update_backing.assert_called_once_with(
+        {"connection": "opts"}, "vm-01", 4000, network_moid="n-1"
+    )
+    set_connected.assert_called_once_with({"connection": "opts"}, "vm-01", 4000, False)
+    assert wait.call_args_list == [
+        (("task-backing",), {"timeout": 30}),
+        (("task-connected",), {"timeout": 30}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("setting", "match"),
+    [
+        ({"adapter_type": "e1000e"}, "changing an existing NIC"),
+        ({"mac": "00:50:56:00:00:02"}, "changing an existing NIC MAC"),
+    ],
+)
+def test_configure_networks_rejects_unsupported_existing_nic_changes(monkeypatch, setting, match):
+    current = {
+        "key": 4000,
+        "label": "Network adapter 1",
+        "device_type": "vim.vm.device.VirtualVmxnet3",
+        "mac_address": "00:50:56:00:00:01",
+        "start_connected": True,
+    }
+    monkeypatch.setattr(cloud, "_vcf_opts", dict)
+    monkeypatch.setattr(cloud.vim_vm_nic, "list_", lambda *args: [current])
+    monkeypatch.setattr(cloud, "_network_target", lambda *args: {"network_moid": "n-1"})
+
+    with pytest.raises(SaltCloudSystemExit, match=match):
+        cloud._configure_networks(
+            "vm-01",
+            {"Network adapter 1": {"name": "server-vlan", **setting}},
+            timeout=30,
+        )
+
+
 def test_customization_nics_builds_static_and_dhcp_entries():
     devices = {
         "Network adapter 1": {
@@ -181,6 +286,25 @@ def test_customization_nics_builds_static_and_dhcp_entries():
         },
         {"dhcp": True},
     ]
+
+
+def test_apply_customization_normalizes_false_string(monkeypatch):
+    monkeypatch.setattr(
+        cloud,
+        "_cfg",
+        lambda name, vm_, default=None, **kwargs: "false" if name == "customization" else default,
+    )
+    apply_customization = MagicMock()
+    monkeypatch.setattr(cloud.vim_vm_customization, "apply", apply_customization)
+
+    cloud._apply_customization(
+        "vm-01",
+        {},
+        {"Network adapter 1": {"ip": "192.0.2.10"}},
+        timeout=30,
+    )
+
+    apply_customization.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -234,7 +358,7 @@ def test_configure_disks_resizes_existing_disk(monkeypatch):
 
     cloud._configure_disks("vm-01", {"Hard disk 2": {"size": 50}}, timeout=30)
 
-    resize.assert_called_once_with({"connection": "opts"}, "vm-01", 2001, 50.0)
+    resize.assert_called_once_with({"connection": "opts"}, "vm-01", 2001, 50)
     wait.assert_called_once_with("task-resize", timeout=30)
 
 
@@ -279,6 +403,15 @@ def test_configure_disks_adds_missing_disk(monkeypatch):
     wait.assert_called_once_with("task-add", timeout=30)
 
 
+@pytest.mark.parametrize("size", [50.5, "50.5"])
+def test_configure_disks_rejects_fractional_sizes(monkeypatch, size):
+    monkeypatch.setattr(cloud, "_vcf_opts", dict)
+    monkeypatch.setattr(cloud.vim_vm_disk, "list_", lambda *args: [])
+
+    with pytest.raises(SaltCloudSystemExit, match="positive whole number"):
+        cloud._configure_disks("vm-01", {"Hard disk 2": {"size": size}}, timeout=30)
+
+
 def test_script_uses_native_salt_cloud_renderer(monkeypatch):
     monkeypatch.setattr(
         cloud.config, "get_cloud_config_value", lambda *args, **kwargs: "bootstrap-salt"
@@ -296,6 +429,29 @@ def test_script_uses_native_salt_cloud_renderer(monkeypatch):
     os_script.assert_called_once_with(
         "bootstrap-salt", {"name": "vm-01"}, cloud.__opts__, "master: master.example"
     )
+
+
+def test_stop_parses_action_kwargs_soft_false(monkeypatch):
+    power_off = MagicMock(return_value="task-off")
+    shutdown_guest = MagicMock()
+    monkeypatch.setattr(cloud, "_vcf_opts", lambda: {"connection": "opts"})
+    monkeypatch.setattr(cloud, "_task_timeout", lambda: 30)
+    monkeypatch.setattr(cloud.vim_vm_power, "power_off", power_off)
+    monkeypatch.setattr(cloud.vim_vm_power, "shutdown_guest", shutdown_guest)
+    monkeypatch.setattr(cloud, "_wait_task", MagicMock())
+
+    assert cloud.stop("vm-01", {"soft": "false"}, call="action") is True
+    power_off.assert_called_once_with({"connection": "opts"}, "vm-01")
+    shutdown_guest.assert_not_called()
+
+
+def test_stop_parses_action_kwargs_soft_true(monkeypatch):
+    shutdown_guest = MagicMock(return_value=True)
+    monkeypatch.setattr(cloud, "_vcf_opts", lambda: {"connection": "opts"})
+    monkeypatch.setattr(cloud.vim_vm_power, "shutdown_guest", shutdown_guest)
+
+    assert cloud.stop("vm-01", {"soft": "true"}, call="action") is True
+    shutdown_guest.assert_called_once_with({"connection": "opts"}, "vm-01")
 
 
 def test_create_clones_configures_and_calls_native_bootstrap(monkeypatch, loader_globals):
@@ -365,6 +521,134 @@ def test_create_clones_configures_and_calls_native_bootstrap(monkeypatch, loader
     )
 
 
+def test_create_returns_error_when_deploy_has_no_ip(monkeypatch, loader_globals):
+    settings = {
+        "name": "vm-01.example.test",
+        "clonefrom": "ubuntu-source",
+        "deploy": True,
+    }
+    source = SimpleNamespace(
+        config=SimpleNamespace(template=False),
+        parent=SimpleNamespace(_moId="group-v42"),
+        datastore=[SimpleNamespace(_moId="datastore-17")],
+    )
+
+    monkeypatch.setattr(
+        cloud,
+        "_cfg",
+        lambda name, vm_, default=None, **kwargs: settings.get(name, default),
+    )
+    monkeypatch.setattr(
+        cloud,
+        "_vm",
+        lambda name, **kwargs: source if name == "ubuntu-source" else None,
+    )
+    monkeypatch.setattr(cloud, "_vcf_opts", lambda: {"connection": "opts"})
+    monkeypatch.setattr(cloud.vim_vm, "clone", MagicMock(return_value="task-clone"))
+    monkeypatch.setattr(cloud.vim_vm_power, "power_on", MagicMock(return_value="task-power"))
+    monkeypatch.setattr(cloud, "_wait_task", MagicMock())
+    monkeypatch.setattr(cloud, "_reconfigure", MagicMock())
+    monkeypatch.setattr(cloud, "_configure_networks", MagicMock())
+    monkeypatch.setattr(cloud, "_configure_disks", MagicMock())
+    monkeypatch.setattr(cloud, "_apply_customization", MagicMock())
+    monkeypatch.setattr(cloud, "_wait_for_ip", lambda *args: None)
+    monkeypatch.setattr(cloud.log, "error", MagicMock())
+    monkeypatch.setattr(
+        cloud,
+        "show_instance",
+        lambda *args, **kwargs: {"id": "vm-123", "name": "vm-01.example.test"},
+    )
+
+    result = cloud.create({"name": "vm-01.example.test", "provider": "lab-vcenter"})
+
+    assert "no IPv4 address" in result["Error"]
+    loader_globals.utils["cloud.bootstrap"].assert_not_called()
+    assert any(
+        call.args[2] == "salt/cloud/vm-01.example.test/deploy_failed"
+        for call in loader_globals.utils["cloud.fire_event"].call_args_list
+    )
+
+
+def test_create_rejects_template_clone_without_resource_pool(monkeypatch):
+    settings = {"name": "vm-01", "clonefrom": "ubuntu-template"}
+    source = SimpleNamespace(
+        config=SimpleNamespace(template=True),
+        parent=SimpleNamespace(_moId="group-v42"),
+        datastore=[SimpleNamespace(_moId="datastore-17")],
+    )
+    clone = MagicMock()
+    monkeypatch.setattr(
+        cloud,
+        "_cfg",
+        lambda name, vm_, default=None, **kwargs: settings.get(name, default),
+    )
+    monkeypatch.setattr(
+        cloud,
+        "_vm",
+        lambda name, **kwargs: source if name == "ubuntu-template" else None,
+    )
+    monkeypatch.setattr(cloud.vim_vm, "clone", clone)
+    monkeypatch.setattr(cloud.log, "exception", MagicMock())
+
+    result = cloud.create({"name": "vm-01", "provider": "lab-vcenter"})
+
+    assert "cluster or resourcepool/resource_pool is required" in result["Error"]
+    clone.assert_not_called()
+
+
+def test_create_template_skips_guest_customization(monkeypatch):
+    settings = {
+        "name": "template-copy",
+        "clonefrom": "ubuntu-template",
+        "cluster": "compute-cluster",
+        "template": True,
+        "devices": {
+            "network": {
+                "Network adapter 1": {
+                    "name": "server-vlan",
+                    "ip": "192.0.2.25",
+                }
+            }
+        },
+    }
+    source = SimpleNamespace(
+        config=SimpleNamespace(template=True),
+        parent=SimpleNamespace(_moId="group-v42"),
+        datastore=[SimpleNamespace(_moId="datastore-17")],
+    )
+    apply_customization = MagicMock()
+    power_on = MagicMock()
+    monkeypatch.setattr(
+        cloud,
+        "_cfg",
+        lambda name, vm_, default=None, **kwargs: settings.get(name, default),
+    )
+    monkeypatch.setattr(
+        cloud,
+        "_vm",
+        lambda name, **kwargs: source if name == "ubuntu-template" else None,
+    )
+    monkeypatch.setattr(cloud, "_vcf_opts", dict)
+    monkeypatch.setattr(cloud.vim_vm, "clone", MagicMock(return_value="task-clone"))
+    monkeypatch.setattr(cloud.vim_vm_power, "power_on", power_on)
+    monkeypatch.setattr(cloud, "_wait_task", MagicMock())
+    monkeypatch.setattr(cloud, "_reconfigure", MagicMock())
+    monkeypatch.setattr(cloud, "_configure_networks", MagicMock())
+    monkeypatch.setattr(cloud, "_configure_disks", MagicMock())
+    monkeypatch.setattr(cloud, "_apply_customization", apply_customization)
+    monkeypatch.setattr(
+        cloud,
+        "show_instance",
+        lambda *args, **kwargs: {"id": "vm-124", "name": "template-copy"},
+    )
+
+    result = cloud.create({"name": "template-copy", "provider": "lab-vcenter"})
+
+    assert result == {"id": "vm-124", "name": "template-copy"}
+    apply_customization.assert_not_called()
+    power_on.assert_not_called()
+
+
 def test_create_rejects_duplicate_vm(monkeypatch):
     monkeypatch.setattr(
         cloud, "_cfg", lambda name, vm_, default=None, **kwargs: vm_.get(name, default)
@@ -396,6 +680,17 @@ def test_destroy_powers_off_destroys_and_clears_cache(monkeypatch, loader_global
     )
 
 
+def test_destroy_cache_cleanup_handles_missing_active_provider(monkeypatch, loader_globals):
+    loader_globals.opts["update_cachedir"] = True
+    monkeypatch.setattr(cloud, "_get_active_provider_name", lambda: None)
+    monkeypatch.setattr(cloud, "_vm", lambda *args, **kwargs: None)
+
+    assert cloud.destroy("vm-01") is True
+    loader_globals.utils["cloud.delete_minion_cachedir"].assert_called_once_with(
+        "vm-01", "vmware", loader_globals.opts
+    )
+
+
 def test_list_node_views(monkeypatch):
     instances = [
         {
@@ -414,3 +709,31 @@ def test_list_node_views(monkeypatch):
     assert cloud.list_nodes_min() == {"vm-01": "poweredOn"}
     assert cloud.list_nodes()["vm-01"]["id"] == "vm-101"
     assert cloud.list_nodes_full() == {"vm-01": instances[0]}
+
+
+def test_list_nodes_select_accepts_function_kwargs(monkeypatch, loader_globals):
+    loader_globals.opts["query.selection"] = ["id", "state"]
+    monkeypatch.setattr(
+        cloud,
+        "_summary_instances",
+        lambda: [{"name": "vm-01", "id": "vm-101", "state": "poweredOn"}],
+    )
+
+    assert cloud.list_nodes_select(kwargs={"unused": "value"}, call="function") == {
+        "vm-01": {"id": "vm-101", "state": "poweredOn"}
+    }
+
+
+def test_avail_images_skips_vm_with_missing_config(monkeypatch):
+    orphaned = SimpleNamespace(name="orphaned", config=None)
+    template = SimpleNamespace(name="ubuntu-template", config=SimpleNamespace(template=True))
+    monkeypatch.setattr(cloud, "_objects", lambda *args: [orphaned, template])
+    monkeypatch.setattr(
+        cloud,
+        "_instance_data",
+        lambda vm_ref: {"id": "vm-101", "name": vm_ref.name, "template": True},
+    )
+
+    assert cloud.avail_images() == {
+        "ubuntu-template": {"id": "vm-101", "name": "ubuntu-template", "template": True}
+    }

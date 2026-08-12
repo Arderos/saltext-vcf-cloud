@@ -149,14 +149,20 @@ ubuntu-2404:
 ```
 
 The keys under `devices.network` and `devices.disk` are device labels. When a
-label already exists on the cloned template, the driver updates or resizes that
-device. A missing NIC label creates a NIC; a missing disk label creates a disk.
-Disks can grow but cannot shrink.
+label already exists on the cloned template, the driver updates its network
+backing and `start_connected` state or resizes the disk. vSphere cannot safely
+change the type or MAC address of an existing NIC through this operation, so a
+different `adapter_type` or `mac` produces a clear error instead of being
+silently ignored. A missing NIC label creates a NIC; a missing disk label creates
+a disk. Disk sizes must be positive whole numbers of GB. Disks can grow but
+cannot shrink.
 
 Use object MoIDs instead of names when vCenter contains duplicate names. For a
 blank VM without `clonefrom`, `folder` and `datastore` are required, together
 with enough placement information (`cluster`, `resourcepool`, or `host`) for
-vCenter to select compute resources.
+vCenter to select compute resources. Cloning from a vCenter template requires
+`cluster` or `resourcepool`/`resource_pool`; `host` alone does not populate the
+required resource pool in the clone placement specification.
 
 ### Static guest networking
 
@@ -187,6 +193,9 @@ customization_spec: linux-default
 Guest customization and address discovery require a compatible guest and
 VMware Tools/open-vm-tools running in the template.
 
+Guest customization is not applied when `template: true`, because vCenter does
+not support `CustomizeVM_Task` against a template object.
+
 ### Profile options
 
 | Option | Default | Meaning |
@@ -199,7 +208,7 @@ VMware Tools/open-vm-tools running in the template.
 | `host` | none | ESXi host name or MoID |
 | `image` | `otherGuest64` | vSphere guest ID for a blank VM |
 | `num_cpus` | source value | Virtual CPU count |
-| `memory` | source value | Memory in MB, `MB`, or `GB` |
+| `memory` | source value | Memory in MB, `M`, `MB`, `G`, or `GB` |
 | `cores_per_socket` | unchanged | Cores per virtual socket |
 | `annotation` | unchanged | VM annotation |
 | `extra_config` | `{}` | vSphere advanced settings mapping |
@@ -289,9 +298,17 @@ Common causes:
 - An object name is ambiguous: use the vSphere MoID.
 - The VM is created but bootstrap does not run: check VMware Tools, guest IP
   reporting, DNS fallback, SSH reachability, username/key, and
-  `wait_for_ip_timeout`.
+  `wait_for_ip_timeout`. The create result contains an `Error` and emits a
+  `deploy_failed` event when no IPv4 address is found or bootstrap reports a
+  failure.
 - Guest customization fails: confirm the template OS supports vSphere guest
   customization and that NIC order matches the profile.
+
+Salt Cloud 3008 pre-accepts the minion key before it calls a provider's
+`create()` function, but does not tell the provider whether the key was accepted
+on the local or a remote master. After a failed deployment, verify the target
+master and remove an unused accepted key with `salt-key -d <minion-id>` when
+appropriate.
 
 The password is not included in Salt Cloud event payloads or returned instance
 data. Debug logs from dependencies can still contain environmental details;
