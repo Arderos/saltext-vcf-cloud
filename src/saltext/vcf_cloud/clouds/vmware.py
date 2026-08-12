@@ -334,9 +334,8 @@ def _resolve_tag(opts, inventory, spec, category_id, create_missing):
     return tag_id
 
 
-def _assign_tags(name, tags):
-    """Resolve named vCenter tags and attach them to a VM."""
-    specs = _tag_specs(tags)
+def _assign_tags(name, specs):
+    """Resolve validated named vCenter tag specs and attach them to a VM."""
     if not specs:
         return []
 
@@ -345,9 +344,18 @@ def _assign_tags(name, tags):
     categories = _category_inventory(opts)
     tag_inventory = _tag_inventory(opts)
     tag_ids = []
+    single_category_tags = {}
     for spec in specs:
         category_id = _resolve_category(opts, categories, spec, create_missing)
         tag_id = _resolve_tag(opts, tag_inventory, spec, category_id, create_missing)
+        if str(categories[category_id].get("cardinality", "")).upper() == "SINGLE":
+            existing = single_category_tags.get(category_id)
+            if existing is not None and existing[0] != tag_id:
+                raise SaltCloudSystemExit(
+                    f"vCenter tag category {spec['category']!r} has cardinality SINGLE; "
+                    f"cannot assign both {existing[1]!r} and {spec['name']!r}"
+                )
+            single_category_tags[category_id] = (tag_id, spec["name"])
         if tag_id not in tag_ids:
             tag_ids.append(tag_id)
 
@@ -1025,16 +1033,20 @@ def create(vm_):
     power_on = _as_bool(_cfg("power_on", vm_, default=True))
     deploy = _as_bool(_cfg("deploy", vm_, default=True))
     devices = _cfg("devices", vm_, default={}) or {}
-    private_key = _cfg("private_key", vm_, default=None, search_global=False)
-    if private_key is None:
-        private_key = _cfg("key_filename", vm_, default=None, search_global=False)
-
-    request_args = __utils__["cloud.filter_event"](
-        "requesting", vm_, ["name", "profile", "provider", "driver"]
-    )
-    _fire_event("requesting instance", f"salt/cloud/{name}/requesting", request_args)
-
     try:
+        tag_specs = _tag_specs(_cfg("tags", vm_, default=None))
+        private_key = _cfg("private_key", vm_, default=None, search_global=False)
+        if private_key is None:
+            private_key = _cfg("key_filename", vm_, default=None, search_global=False)
+
+        _fire_event(
+            "requesting instance",
+            f"salt/cloud/{name}/requesting",
+            __utils__["cloud.filter_event"](
+                "requesting", vm_, ["name", "profile", "provider", "driver"]
+            ),
+        )
+
         if source_name:
             source = _vm(source_name)
             source_is_template = bool(getattr(getattr(source, "config", None), "template", False))
@@ -1091,7 +1103,7 @@ def create(vm_):
         if not template:
             _apply_customization(name, vm_, devices.get("network"), timeout)
 
-        _assign_tags(name, _cfg("tags", vm_, default=None))
+        _assign_tags(name, tag_specs)
 
         if not template and power_on:
             _wait_task(

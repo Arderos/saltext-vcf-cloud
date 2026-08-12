@@ -209,6 +209,46 @@ def test_assign_tags_resolves_names_and_attaches_unique_ids(monkeypatch):
     ]
 
 
+def test_assign_tags_rejects_conflicting_single_category_tags(monkeypatch):
+    assign = MagicMock()
+    vm_id = MagicMock(return_value="vm-123")
+    monkeypatch.setattr(cloud, "_vcf_opts", lambda: {"connection": "opts"})
+    monkeypatch.setattr(cloud, "_provider_value", lambda name, default=None: default)
+    monkeypatch.setattr(cloud, "_vm_id", vm_id)
+    monkeypatch.setattr(cloud.vcenter_tag_category, "list_", lambda opts: ["cat-os"])
+    monkeypatch.setattr(
+        cloud.vcenter_tag_category,
+        "get",
+        lambda opts, category_id: {
+            "name": "Operating System",
+            "cardinality": "SINGLE",
+            "associable_types": ["VirtualMachine"],
+        },
+    )
+    monkeypatch.setattr(cloud.vcenter_tag, "list_", lambda opts: ["tag-linux", "tag-windows"])
+    monkeypatch.setattr(
+        cloud.vcenter_tag,
+        "get",
+        lambda opts, tag_id: {
+            "tag-linux": {"name": "Linux", "category_id": "cat-os"},
+            "tag-windows": {"name": "Windows", "category_id": "cat-os"},
+        }[tag_id],
+    )
+    monkeypatch.setattr(cloud.vcenter_tag, "assign", assign)
+
+    with pytest.raises(SaltCloudSystemExit, match="cardinality SINGLE"):
+        cloud._assign_tags(
+            "vm-01",
+            [
+                {"category": "Operating System", "name": "Linux"},
+                {"category": "Operating System", "name": "Windows"},
+            ],
+        )
+
+    vm_id.assert_not_called()
+    assign.assert_not_called()
+
+
 def test_assign_tags_creates_missing_category_and_tag(monkeypatch):
     monkeypatch.setattr(cloud, "_vcf_opts", lambda: {"connection": "opts"})
     provider = {
@@ -421,9 +461,9 @@ def test_resolve_category_validates_existing_category(details, match):
         ),
     ],
 )
-def test_assign_tags_rejects_invalid_specs(tags, match):
+def test_tag_specs_rejects_invalid_specs(tags, match):
     with pytest.raises(SaltCloudSystemExit, match=match):
-        cloud._assign_tags("vm-01", tags)
+        cloud._tag_specs(tags)
 
 
 def test_new_tag_category_cardinality_rejects_invalid_override(monkeypatch):
@@ -854,6 +894,31 @@ def test_create_clones_configures_and_calls_native_bootstrap(monkeypatch, loader
     assert loader_globals.utils["cloud.fire_event"].call_args.kwargs["args"]["minion_id"] == (
         "vm-01.example.test"
     )
+
+
+def test_create_validates_tags_before_clone(monkeypatch):
+    settings = {
+        "name": "vm-01",
+        "clonefrom": "ubuntu-template",
+        "tags": {
+            "category": "Operating System",
+            "name": "Linux",
+        },
+    }
+    clone = MagicMock()
+    monkeypatch.setattr(
+        cloud,
+        "_cfg",
+        lambda name, vm_, default=None, **kwargs: settings.get(name, default),
+    )
+    monkeypatch.setattr(cloud, "_vm", lambda name, **kwargs: None)
+    monkeypatch.setattr(cloud.vim_vm, "clone", clone)
+    monkeypatch.setattr(cloud.log, "exception", MagicMock())
+
+    result = cloud.create({"name": "vm-01", "provider": "lab-vcenter"})
+
+    assert "tags must be a list" in result["Error"]
+    clone.assert_not_called()
 
 
 @pytest.mark.parametrize(
