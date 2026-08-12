@@ -571,6 +571,9 @@ def test_create_clones_configures_and_calls_native_bootstrap(monkeypatch, loader
     )
     wait_for_grains.assert_called_once_with(vm_definition, 120)
     show_instance.assert_not_called()
+    assert loader_globals.utils["cloud.fire_event"].call_args.kwargs["args"]["minion_id"] == (
+        "vm-01.example.test"
+    )
 
 
 def test_create_returns_error_when_deploy_has_no_ip(monkeypatch, loader_globals):

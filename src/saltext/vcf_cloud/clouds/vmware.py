@@ -940,5 +940,7 @@ def create(vm_):
     created_args = __utils__["cloud.filter_event"](
         "created", vm_, ["name", "profile", "provider", "driver"]
     )
+    if grains is not None:
+        created_args["minion_id"] = grains.get("id") or _minion_id(vm_)
     _fire_event("created instance", f"salt/cloud/{name}/created", created_args)
     return data
