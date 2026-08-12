@@ -30,6 +30,8 @@ __virtualname__ = "vmware"
 
 try:
     from pyVmomi import vim
+    from saltext.vcf.clients import vcenter_tag
+    from saltext.vcf.clients import vcenter_tag_category
     from saltext.vcf.clients import vim_vm
     from saltext.vcf.clients import vim_vm_customization
     from saltext.vcf.clients import vim_vm_disk
@@ -186,6 +188,201 @@ def _find_object(vim_type, name_or_id, required=True):
 
 def _vm(name, required=True):
     return _find_object(vim.VirtualMachine, name, required=required)
+
+
+def _vm_id(name):
+    vm_id = getattr(_vm(name), "_moId", None)
+    if not vm_id:
+        raise SaltCloudSystemExit(f"VM {name!r} has no managed object ID")
+    return vm_id
+
+
+def _tag_specs(tags):
+    if tags is None:
+        return []
+    if not isinstance(tags, (list, tuple)):
+        raise SaltCloudSystemExit("tags must be a list of category/name mappings")
+
+    specs = []
+    for item in tags:
+        if not isinstance(item, dict):
+            raise SaltCloudSystemExit("each tags entry must contain category and name")
+        unsupported = set(item) - {"category", "name"}
+        if unsupported:
+            raise SaltCloudSystemExit(
+                "unsupported tags entry options: " + ", ".join(sorted(unsupported))
+            )
+        category = item.get("category")
+        tag_name = item.get("name")
+        if not isinstance(category, str) or not category.strip():
+            raise SaltCloudSystemExit("each tags entry requires a non-empty category")
+        if not isinstance(tag_name, str) or not tag_name.strip():
+            raise SaltCloudSystemExit("each tags entry requires a non-empty name")
+        specs.append(
+            {
+                "category": category.strip(),
+                "name": tag_name.strip(),
+            }
+        )
+    return specs
+
+
+def _new_tag_category_cardinality(category_name):
+    default = str(_provider_value("default_tag_category_cardinality", "SINGLE")).upper()
+    overrides = _provider_value("tag_category_cardinalities", {}) or {}
+    if not isinstance(overrides, dict):
+        raise SaltCloudSystemExit("provider tag_category_cardinalities must be a mapping")
+    cardinality = str(overrides.get(category_name, default)).upper()
+    if cardinality not in ("SINGLE", "MULTIPLE"):
+        raise SaltCloudSystemExit(
+            f"invalid cardinality {cardinality!r} for new vCenter tag category "
+            f"{category_name!r}; expected SINGLE or MULTIPLE"
+        )
+    return cardinality
+
+
+def _category_inventory(opts):
+    return {
+        category_id: vcenter_tag_category.get(opts, category_id)
+        for category_id in vcenter_tag_category.list_(opts)
+    }
+
+
+def _tag_inventory(opts, tag_ids=None):
+    if tag_ids is None:
+        tag_ids = vcenter_tag.list_(opts)
+    return {tag_id: vcenter_tag.get(opts, tag_id) for tag_id in tag_ids}
+
+
+def _named_match(inventory, name, kind, category_id=None):
+    matches = [
+        (object_id, details)
+        for object_id, details in inventory.items()
+        if details.get("name") == name
+        and (category_id is None or details.get("category_id") == category_id)
+    ]
+    if len(matches) > 1:
+        qualifier = " in the selected category" if category_id else ""
+        raise SaltCloudSystemExit(f"More than one vCenter {kind} is named {name!r}{qualifier}")
+    return matches[0] if matches else None
+
+
+def _resolve_category(opts, inventory, spec, create_missing):
+    match = _named_match(inventory, spec["category"], "tag category")
+    if match is None:
+        if not create_missing:
+            raise SaltCloudSystemExit(
+                f"vCenter tag category {spec['category']!r} does not exist and "
+                "provider create_missing_tags is false"
+            )
+        try:
+            cardinality = _new_tag_category_cardinality(spec["category"])
+            category_id = vcenter_tag_category.create(
+                opts,
+                spec["category"],
+                cardinality=cardinality,
+                associable_types=["VirtualMachine"],
+            )
+            details = vcenter_tag_category.get(opts, category_id)
+        except Exception:  # pylint: disable=broad-except
+            refreshed = _category_inventory(opts)
+            match = _named_match(refreshed, spec["category"], "tag category")
+            if match is None:
+                raise
+            inventory.update(refreshed)
+            category_id, details = match
+        else:
+            inventory[category_id] = details
+    else:
+        category_id, details = match
+
+    actual_cardinality = str(details.get("cardinality", "")).upper()
+    if actual_cardinality not in ("SINGLE", "MULTIPLE"):
+        raise SaltCloudSystemExit(
+            f"vCenter tag category {spec['category']!r} has cardinality "
+            f"{actual_cardinality or 'UNKNOWN'}, expected SINGLE or MULTIPLE"
+        )
+    associable_types = details.get("associable_types") or []
+    if associable_types and "VirtualMachine" not in associable_types:
+        raise SaltCloudSystemExit(
+            f"vCenter tag category {spec['category']!r} cannot be assigned to VirtualMachine"
+        )
+    return category_id
+
+
+def _resolve_tag(opts, inventory, spec, category_id, create_missing):
+    match = _named_match(inventory, spec["name"], "tag", category_id=category_id)
+    if match is not None:
+        return match[0]
+    if not create_missing:
+        raise SaltCloudSystemExit(
+            f"vCenter tag {spec['name']!r} does not exist in category "
+            f"{spec['category']!r} and provider create_missing_tags is false"
+        )
+
+    try:
+        tag_id = vcenter_tag.create(opts, spec["name"], category_id)
+        details = vcenter_tag.get(opts, tag_id)
+    except Exception:  # pylint: disable=broad-except
+        refreshed = _tag_inventory(opts)
+        match = _named_match(refreshed, spec["name"], "tag", category_id=category_id)
+        if match is None:
+            raise
+        inventory.update(refreshed)
+        return match[0]
+    inventory[tag_id] = details
+    return tag_id
+
+
+def _assign_tags(name, tags):
+    """Resolve named vCenter tags and attach them to a VM."""
+    specs = _tag_specs(tags)
+    if not specs:
+        return []
+
+    opts = _vcf_opts()
+    create_missing = _as_bool(_provider_value("create_missing_tags", False))
+    categories = _category_inventory(opts)
+    tag_inventory = _tag_inventory(opts)
+    tag_ids = []
+    for spec in specs:
+        category_id = _resolve_category(opts, categories, spec, create_missing)
+        tag_id = _resolve_tag(opts, tag_inventory, spec, category_id, create_missing)
+        if tag_id not in tag_ids:
+            tag_ids.append(tag_id)
+
+    vm_id = _vm_id(name)
+    for tag_id in tag_ids:
+        vcenter_tag.assign(opts, tag_id, "VirtualMachine", vm_id)
+    return tag_ids
+
+
+def _readable_tags(opts, tag_ids=None):
+    categories = _category_inventory(opts)
+    tags = _tag_inventory(opts, tag_ids=tag_ids)
+    result = {}
+    for details in tags.values():
+        category = categories.get(details.get("category_id"), {})
+        category_name = category.get("name")
+        tag_name = details.get("name")
+        if not category_name or not tag_name:
+            continue
+        entry = result.setdefault(
+            category_name,
+            {
+                "cardinality": category.get("cardinality"),
+                "tags": [],
+            },
+        )
+        if tag_name not in entry["tags"]:
+            entry["tags"].append(tag_name)
+    return {
+        category_name: {
+            "cardinality": details["cardinality"],
+            "tags": sorted(details["tags"]),
+        }
+        for category_name, details in sorted(result.items())
+    }
 
 
 def _wait_task(task_or_id, timeout=900):
@@ -663,6 +860,11 @@ def avail_images(call=None):
     return templates
 
 
+def avail_tags(call=None):
+    """Return readable vCenter tags grouped by category name."""
+    return _readable_tags(_vcf_opts())
+
+
 def avail_sizes(call=None):
     """Return sizes (vSphere CPU and memory are configured in profiles)."""
     return {}
@@ -708,6 +910,13 @@ def show_instance(name, call=None):
     """Return details for one VM, or an empty mapping when it is absent."""
     vm_ref = _vm(name, required=False)
     return _instance_data(vm_ref) if vm_ref else {}
+
+
+def show_tags(name, call=None):
+    """Return readable vCenter tags attached to one VM."""
+    opts = _vcf_opts()
+    tag_ids = vcenter_tag.list_assigned(opts, "VirtualMachine", _vm_id(name))
+    return _readable_tags(opts, tag_ids=tag_ids)
 
 
 def get_vcenter_version(kwargs=None, call=None):
@@ -881,6 +1090,8 @@ def create(vm_):
         _configure_disks(name, devices.get("disk"), timeout)
         if not template:
             _apply_customization(name, vm_, devices.get("network"), timeout)
+
+        _assign_tags(name, _cfg("tags", vm_, default=None))
 
         if not template and power_on:
             _wait_task(
