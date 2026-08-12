@@ -18,6 +18,7 @@ extension handles the vSphere operations through `saltext.vcf` and pyVmomi.
 - Clone a VM or template, or create a blank VM.
 - Select folders, datastores, clusters, resource pools, and hosts by name or MoID.
 - Configure CPU, memory, advanced settings, hot-add options, NICs, and disks.
+- Attach existing vCenter tags to newly created VMs and templates.
 - Apply a named vCenter customization spec or generate a Linux customization spec.
 - Wait for an address reported by VMware Tools, run the native Salt bootstrap,
   and return the new minion's complete grains dictionary.
@@ -82,6 +83,7 @@ lab-vcenter:
   password: replace-with-a-secret
   verify_ssl: true
   task_timeout: 900
+  create_missing_tags: false
 ```
 
 Do not commit the real password. Protect the provider file with restrictive
@@ -100,12 +102,16 @@ Provider options:
 | `port` | no | `443` | vCenter HTTPS port |
 | `vcf_timeout` | no | `30` | Connection timeout in seconds |
 | `task_timeout` | no | `900` | Default vSphere task timeout in seconds |
+| `create_missing_tags` | no | `false` | Create missing tag categories and tags |
+| `default_tag_category_cardinality` | no | `SINGLE` | Cardinality for new categories without an override |
+| `tag_category_cardinalities` | no | `{}` | New-category cardinality overrides keyed by exact category name |
 
 Check connectivity without creating anything:
 
 ```bash
 salt-cloud -f get_vcenter_version lab-vcenter
 salt-cloud -f avail_images lab-vcenter
+salt-cloud -f avail_tags lab-vcenter
 ```
 
 ## Configure a profile
@@ -124,6 +130,11 @@ ubuntu-2404:
   memory: 4GB
   cores_per_socket: 1
   annotation: Managed by Salt Cloud
+  tags:
+    - category: Environment
+      name: Production
+    - category: Operating System
+      name: Ubuntu
 
   devices:
     network:
@@ -164,6 +175,48 @@ with enough placement information (`cluster`, `resourcepool`, or `host`) for
 vCenter to select compute resources. Cloning from a vCenter template requires
 `cluster` or `resourcepool`/`resource_pool`; `host` alone does not populate the
 required resource pool in the clone placement specification.
+
+### vCenter tags
+
+Set `tags` to a list of category/name mappings. Both names are matched exactly;
+the category is mandatory because vCenter tag names are only meaningful within
+their category. Internal vCenter IDs are resolved by the driver and never need
+to appear in a profile or map.
+
+List the available category and tag names through the same Salt Cloud provider:
+
+```bash
+salt-cloud -f avail_tags lab-vcenter
+```
+
+Inspect the tags attached to one VM:
+
+```bash
+salt-cloud -a show_tags web-01.example.com
+```
+
+By default, both the category and tag must already exist. Set
+`create_missing_tags: true` on the provider to create missing objects. A missing
+tag is created inside the existing category. A missing category is created for
+`VirtualMachine` objects with `default_tag_category_cardinality`, which defaults
+to `SINGLE`. Categories that must allow several tags per VM can override that
+default by exact category name:
+
+```yaml
+create_missing_tags: true
+default_tag_category_cardinality: SINGLE
+tag_category_cardinalities:
+  Capabilities: MULTIPLE
+```
+
+Overrides are consulted only when a category is absent. Existing categories
+always retain their vCenter configuration and do not need to be repeated in the
+provider.
+
+Tags are attached after VM configuration and guest customization, but before
+power-on and Salt bootstrap. Duplicate category/name entries are attached only
+once. If lookup, creation, or assignment fails, `create` returns an error and
+does not continue to power-on or bootstrap the VM.
 
 ### Static guest networking
 
@@ -212,6 +265,7 @@ not support `CustomizeVM_Task` against a template object.
 | `memory` | source value | Memory in MB, `M`, `MB`, `G`, or `GB` |
 | `cores_per_socket` | unchanged | Cores per virtual socket |
 | `annotation` | unchanged | VM annotation |
+| `tags` | none | List of exact vCenter `category`/`name` mappings to attach |
 | `extra_config` | `{}` | vSphere advanced settings mapping |
 | `cpu_hot_add` | unchanged | Enable CPU hot-add |
 | `cpu_hot_remove` | unchanged | Enable CPU hot-remove |
@@ -265,6 +319,7 @@ salt-cloud -F
 salt-cloud -a start web-01.example.com
 salt-cloud -a stop web-01.example.com
 salt-cloud -a reboot web-01.example.com
+salt-cloud -a show_tags web-01.example.com
 salt-cloud -d web-01.example.com
 ```
 

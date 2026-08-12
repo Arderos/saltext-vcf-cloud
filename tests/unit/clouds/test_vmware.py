@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from unittest.mock import call
 
 import pytest
 from salt.exceptions import SaltClientError
@@ -168,6 +169,311 @@ def test_find_object_rejects_ambiguous_name(monkeypatch):
 
     with pytest.raises(SaltCloudSystemExit, match="More than one"):
         cloud._find_object(SimpleNamespace, "duplicate")
+
+
+def test_assign_tags_resolves_names_and_attaches_unique_ids(monkeypatch):
+    assign = MagicMock()
+    monkeypatch.setattr(cloud, "_vcf_opts", lambda: {"connection": "opts"})
+    monkeypatch.setattr(cloud, "_provider_value", lambda name, default=None: default)
+    monkeypatch.setattr(cloud, "_vm_id", lambda name: "vm-123")
+    monkeypatch.setattr(cloud.vcenter_tag_category, "list_", lambda opts: ["cat-os"])
+    monkeypatch.setattr(
+        cloud.vcenter_tag_category,
+        "get",
+        lambda opts, category_id: {
+            "name": "Operating System",
+            "cardinality": "SINGLE",
+            "associable_types": ["VirtualMachine"],
+        },
+    )
+    monkeypatch.setattr(cloud.vcenter_tag, "list_", lambda opts: ["tag-ubuntu"])
+    monkeypatch.setattr(
+        cloud.vcenter_tag,
+        "get",
+        lambda opts, tag_id: {
+            "name": "Ubuntu VMs",
+            "category_id": "cat-os",
+        },
+    )
+    monkeypatch.setattr(cloud.vcenter_tag, "assign", assign)
+
+    specs = [
+        {"category": "Operating System", "name": "Ubuntu VMs"},
+        {"category": "Operating System", "name": "Ubuntu VMs"},
+    ]
+    result = cloud._assign_tags("vm-01", specs)
+
+    assert result == ["tag-ubuntu"]
+    assert assign.call_args_list == [
+        call({"connection": "opts"}, "tag-ubuntu", "VirtualMachine", "vm-123"),
+    ]
+
+
+def test_assign_tags_rejects_conflicting_single_category_tags(monkeypatch):
+    assign = MagicMock()
+    vm_id = MagicMock(return_value="vm-123")
+    monkeypatch.setattr(cloud, "_vcf_opts", lambda: {"connection": "opts"})
+    monkeypatch.setattr(cloud, "_provider_value", lambda name, default=None: default)
+    monkeypatch.setattr(cloud, "_vm_id", vm_id)
+    monkeypatch.setattr(cloud.vcenter_tag_category, "list_", lambda opts: ["cat-os"])
+    monkeypatch.setattr(
+        cloud.vcenter_tag_category,
+        "get",
+        lambda opts, category_id: {
+            "name": "Operating System",
+            "cardinality": "SINGLE",
+            "associable_types": ["VirtualMachine"],
+        },
+    )
+    monkeypatch.setattr(cloud.vcenter_tag, "list_", lambda opts: ["tag-linux", "tag-windows"])
+    monkeypatch.setattr(
+        cloud.vcenter_tag,
+        "get",
+        lambda opts, tag_id: {
+            "tag-linux": {"name": "Linux", "category_id": "cat-os"},
+            "tag-windows": {"name": "Windows", "category_id": "cat-os"},
+        }[tag_id],
+    )
+    monkeypatch.setattr(cloud.vcenter_tag, "assign", assign)
+
+    with pytest.raises(SaltCloudSystemExit, match="cardinality SINGLE"):
+        cloud._assign_tags(
+            "vm-01",
+            [
+                {"category": "Operating System", "name": "Linux"},
+                {"category": "Operating System", "name": "Windows"},
+            ],
+        )
+
+    vm_id.assert_not_called()
+    assign.assert_not_called()
+
+
+def test_assign_tags_creates_missing_category_and_tag(monkeypatch):
+    monkeypatch.setattr(cloud, "_vcf_opts", lambda: {"connection": "opts"})
+    provider = {
+        "create_missing_tags": True,
+        "default_tag_category_cardinality": "SINGLE",
+        "tag_category_cardinalities": {"Capabilities": "MULTIPLE"},
+    }
+    monkeypatch.setattr(
+        cloud, "_provider_value", lambda name, default=None: provider.get(name, default)
+    )
+    monkeypatch.setattr(cloud, "_vm_id", lambda name: "vm-123")
+    monkeypatch.setattr(cloud.vcenter_tag_category, "list_", lambda opts: [])
+    category_get = MagicMock(
+        return_value={
+            "name": "Capabilities",
+            "cardinality": "MULTIPLE",
+            "associable_types": ["VirtualMachine"],
+        }
+    )
+    category_create = MagicMock(return_value="cat-capabilities")
+    monkeypatch.setattr(cloud.vcenter_tag_category, "get", category_get)
+    monkeypatch.setattr(cloud.vcenter_tag_category, "create", category_create)
+    monkeypatch.setattr(cloud.vcenter_tag, "list_", lambda opts: [])
+    tag_get = MagicMock(return_value={"name": "Docker", "category_id": "cat-capabilities"})
+    tag_create = MagicMock(return_value="tag-docker")
+    monkeypatch.setattr(cloud.vcenter_tag, "get", tag_get)
+    monkeypatch.setattr(cloud.vcenter_tag, "create", tag_create)
+    assign = MagicMock()
+    monkeypatch.setattr(cloud.vcenter_tag, "assign", assign)
+
+    result = cloud._assign_tags("vm-01", [{"category": "Capabilities", "name": "Docker"}])
+
+    assert result == ["tag-docker"]
+    category_create.assert_called_once_with(
+        {"connection": "opts"},
+        "Capabilities",
+        cardinality="MULTIPLE",
+        associable_types=["VirtualMachine"],
+    )
+    tag_create.assert_called_once_with({"connection": "opts"}, "Docker", "cat-capabilities")
+    assign.assert_called_once_with({"connection": "opts"}, "tag-docker", "VirtualMachine", "vm-123")
+
+
+def test_assign_tags_creates_missing_tag_in_existing_category(monkeypatch):
+    monkeypatch.setattr(cloud, "_vcf_opts", dict)
+    monkeypatch.setattr(
+        cloud,
+        "_provider_value",
+        lambda name, default=None: True if name == "create_missing_tags" else default,
+    )
+    monkeypatch.setattr(cloud, "_vm_id", lambda name: "vm-123")
+    monkeypatch.setattr(cloud.vcenter_tag_category, "list_", lambda opts: ["cat-os"])
+    monkeypatch.setattr(
+        cloud.vcenter_tag_category,
+        "get",
+        lambda opts, category_id: {
+            "name": "Operating System",
+            "cardinality": "SINGLE",
+            "associable_types": ["VirtualMachine"],
+        },
+    )
+    monkeypatch.setattr(cloud.vcenter_tag_category, "create", MagicMock())
+    monkeypatch.setattr(cloud.vcenter_tag, "list_", lambda opts: [])
+    monkeypatch.setattr(
+        cloud.vcenter_tag,
+        "get",
+        lambda opts, tag_id: {"name": "Ubuntu VMs", "category_id": "cat-os"},
+    )
+    tag_create = MagicMock(return_value="tag-ubuntu")
+    assign = MagicMock()
+    monkeypatch.setattr(cloud.vcenter_tag, "create", tag_create)
+    monkeypatch.setattr(cloud.vcenter_tag, "assign", assign)
+
+    assert cloud._assign_tags(
+        "vm-01", [{"category": "Operating System", "name": "Ubuntu VMs"}]
+    ) == ["tag-ubuntu"]
+    cloud.vcenter_tag_category.create.assert_not_called()
+    tag_create.assert_called_once_with({}, "Ubuntu VMs", "cat-os")
+    assign.assert_called_once_with({}, "tag-ubuntu", "VirtualMachine", "vm-123")
+
+
+def test_assign_tags_recovers_when_category_is_created_concurrently(monkeypatch):
+    monkeypatch.setattr(cloud, "_vcf_opts", dict)
+    monkeypatch.setattr(
+        cloud,
+        "_provider_value",
+        lambda name, default=None: True if name == "create_missing_tags" else default,
+    )
+    monkeypatch.setattr(cloud, "_vm_id", lambda name: "vm-123")
+    category_list = MagicMock(side_effect=[[], ["cat-os"]])
+    monkeypatch.setattr(cloud.vcenter_tag_category, "list_", category_list)
+    monkeypatch.setattr(
+        cloud.vcenter_tag_category,
+        "get",
+        lambda opts, category_id: {
+            "name": "Operating System",
+            "cardinality": "SINGLE",
+            "associable_types": ["VirtualMachine"],
+        },
+    )
+    monkeypatch.setattr(
+        cloud.vcenter_tag_category,
+        "create",
+        MagicMock(side_effect=RuntimeError("already exists")),
+    )
+    monkeypatch.setattr(cloud.vcenter_tag, "list_", lambda opts: ["tag-ubuntu"])
+    monkeypatch.setattr(
+        cloud.vcenter_tag,
+        "get",
+        lambda opts, tag_id: {"name": "Ubuntu VMs", "category_id": "cat-os"},
+    )
+    assign = MagicMock()
+    monkeypatch.setattr(cloud.vcenter_tag, "assign", assign)
+
+    assert cloud._assign_tags(
+        "vm-01", [{"category": "Operating System", "name": "Ubuntu VMs"}]
+    ) == ["tag-ubuntu"]
+    assign.assert_called_once_with({}, "tag-ubuntu", "VirtualMachine", "vm-123")
+
+
+@pytest.mark.parametrize(
+    ("provider", "category", "expected"),
+    [
+        ({}, "Operating System", "SINGLE"),
+        (
+            {"tag_category_cardinalities": {"Capabilities": "multiple"}},
+            "Capabilities",
+            "MULTIPLE",
+        ),
+    ],
+)
+def test_new_tag_category_cardinality_uses_provider_defaults(
+    monkeypatch, provider, category, expected
+):
+    monkeypatch.setattr(
+        cloud, "_provider_value", lambda name, default=None: provider.get(name, default)
+    )
+
+    assert cloud._new_tag_category_cardinality(category) == expected
+
+
+def test_assign_tags_refuses_missing_category_when_creation_is_disabled(monkeypatch):
+    monkeypatch.setattr(cloud, "_vcf_opts", dict)
+    monkeypatch.setattr(cloud, "_provider_value", lambda name, default=None: default)
+    monkeypatch.setattr(cloud.vcenter_tag_category, "list_", lambda opts: [])
+    monkeypatch.setattr(cloud.vcenter_tag, "list_", lambda opts: [])
+
+    with pytest.raises(SaltCloudSystemExit, match="create_missing_tags is false"):
+        cloud._assign_tags("vm-01", [{"category": "Operating System", "name": "Ubuntu VMs"}])
+
+
+def test_resolve_tag_refuses_missing_tag_when_creation_is_disabled():
+    with pytest.raises(SaltCloudSystemExit, match="create_missing_tags is false"):
+        cloud._resolve_tag(
+            {},
+            {},
+            {"category": "Operating System", "name": "Ubuntu VMs"},
+            "cat-os",
+            create_missing=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("details", "match"),
+    [
+        (
+            {
+                "name": "Operating System",
+                "cardinality": "UNKNOWN",
+                "associable_types": ["VirtualMachine"],
+            },
+            "expected SINGLE or MULTIPLE",
+        ),
+        (
+            {
+                "name": "Operating System",
+                "cardinality": "SINGLE",
+                "associable_types": ["HostSystem"],
+            },
+            "cannot be assigned to VirtualMachine",
+        ),
+    ],
+)
+def test_resolve_category_validates_existing_category(details, match):
+    with pytest.raises(SaltCloudSystemExit, match=match):
+        cloud._resolve_category(
+            {},
+            {"cat-os": details},
+            {"category": "Operating System", "name": "Ubuntu VMs"},
+            create_missing=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("tags", "match"),
+    [
+        ({"category": "Operating System", "name": "Ubuntu VMs"}, "must be a list"),
+        (["Ubuntu VMs"], "must contain category and name"),
+        ([{"name": "Ubuntu VMs"}], "non-empty category"),
+        ([{"category": "Operating System"}], "non-empty name"),
+        (
+            [
+                {
+                    "category": "Operating System",
+                    "name": "Ubuntu VMs",
+                    "cardinality": "SINGLE",
+                }
+            ],
+            "unsupported tags entry options: cardinality",
+        ),
+    ],
+)
+def test_tag_specs_rejects_invalid_specs(tags, match):
+    with pytest.raises(SaltCloudSystemExit, match=match):
+        cloud._tag_specs(tags)
+
+
+def test_new_tag_category_cardinality_rejects_invalid_override(monkeypatch):
+    provider = {"tag_category_cardinalities": {"Capabilities": "MANY"}}
+    monkeypatch.setattr(
+        cloud, "_provider_value", lambda name, default=None: provider.get(name, default)
+    )
+
+    with pytest.raises(SaltCloudSystemExit, match="expected SINGLE or MULTIPLE"):
+        cloud._new_tag_category_cardinality("Capabilities")
 
 
 def test_network_target_enforces_standard_switch_type(monkeypatch):
@@ -507,6 +813,10 @@ def test_create_clones_configures_and_calls_native_bootstrap(monkeypatch, loader
         "clonefrom": "ubuntu-template",
         "num_cpus": 4,
         "memory": "8GB",
+        "tags": [
+            {"category": "Environment", "name": "Production"},
+            {"category": "Operating System", "name": "Linux"},
+        ],
         "devices": {"network": {"Network adapter 1": {"name": "server-vlan"}}},
         "private_key": "/root/.ssh/salt-cloud",
     }
@@ -534,6 +844,8 @@ def test_create_clones_configures_and_calls_native_bootstrap(monkeypatch, loader
     monkeypatch.setattr(cloud, "_configure_networks", MagicMock())
     monkeypatch.setattr(cloud, "_configure_disks", MagicMock())
     monkeypatch.setattr(cloud, "_apply_customization", MagicMock())
+    assign_tags = MagicMock()
+    monkeypatch.setattr(cloud, "_assign_tags", assign_tags)
     monkeypatch.setattr(cloud, "_wait_for_ip", lambda *args: "192.0.2.25")
     guest_grains = {
         "id": "vm-01.example.test",
@@ -565,6 +877,13 @@ def test_create_clones_configures_and_calls_native_bootstrap(monkeypatch, loader
         annotation=None,
     )
     power_on.assert_called_once_with({"connection": "opts"}, "vm-01.example.test", host=None)
+    assign_tags.assert_called_once_with(
+        "vm-01.example.test",
+        [
+            {"category": "Environment", "name": "Production"},
+            {"category": "Operating System", "name": "Linux"},
+        ],
+    )
     assert vm_definition["key_filename"] == "/root/.ssh/salt-cloud"
     assert vm_definition["ssh_host"] == "192.0.2.25"
     loader_globals.utils["cloud.bootstrap"].assert_called_once_with(
@@ -575,6 +894,31 @@ def test_create_clones_configures_and_calls_native_bootstrap(monkeypatch, loader
     assert loader_globals.utils["cloud.fire_event"].call_args.kwargs["args"]["minion_id"] == (
         "vm-01.example.test"
     )
+
+
+def test_create_validates_tags_before_clone(monkeypatch):
+    settings = {
+        "name": "vm-01",
+        "clonefrom": "ubuntu-template",
+        "tags": {
+            "category": "Operating System",
+            "name": "Linux",
+        },
+    }
+    clone = MagicMock()
+    monkeypatch.setattr(
+        cloud,
+        "_cfg",
+        lambda name, vm_, default=None, **kwargs: settings.get(name, default),
+    )
+    monkeypatch.setattr(cloud, "_vm", lambda name, **kwargs: None)
+    monkeypatch.setattr(cloud.vim_vm, "clone", clone)
+    monkeypatch.setattr(cloud.log, "exception", MagicMock())
+
+    result = cloud.create({"name": "vm-01", "provider": "lab-vcenter"})
+
+    assert "tags must be a list" in result["Error"]
+    clone.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -856,4 +1200,61 @@ def test_avail_images_skips_vm_with_missing_config(monkeypatch):
 
     assert cloud.avail_images() == {
         "ubuntu-template": {"id": "vm-101", "name": "ubuntu-template", "template": True}
+    }
+
+
+def test_avail_tags_returns_names_grouped_by_category(monkeypatch):
+    monkeypatch.setattr(cloud, "_vcf_opts", lambda: {"connection": "opts"})
+    monkeypatch.setattr(cloud.vcenter_tag_category, "list_", lambda opts: ["cat-env", "cat-os"])
+    categories = {
+        "cat-env": {"name": "Environment", "cardinality": "SINGLE"},
+        "cat-os": {"name": "Operating System", "cardinality": "SINGLE"},
+    }
+    monkeypatch.setattr(
+        cloud.vcenter_tag_category,
+        "get",
+        lambda opts, category_id: categories[category_id],
+    )
+    monkeypatch.setattr(cloud.vcenter_tag, "list_", lambda opts: ["tag-1", "tag-2"])
+    tags = {
+        "tag-1": {"name": "Production", "category_id": "cat-env"},
+        "tag-2": {"name": "Linux", "category_id": "cat-os"},
+    }
+    monkeypatch.setattr(
+        cloud.vcenter_tag,
+        "get",
+        lambda opts, tag_id: tags[tag_id],
+    )
+
+    assert cloud.avail_tags() == {
+        "Environment": {"cardinality": "SINGLE", "tags": ["Production"]},
+        "Operating System": {"cardinality": "SINGLE", "tags": ["Linux"]},
+    }
+
+
+def test_show_tags_returns_tags_attached_to_vm(monkeypatch):
+    monkeypatch.setattr(cloud, "_vcf_opts", lambda: {"connection": "opts"})
+    monkeypatch.setattr(cloud, "_vm_id", lambda name: "vm-123")
+    monkeypatch.setattr(cloud.vcenter_tag_category, "list_", lambda opts: ["cat-env"])
+    monkeypatch.setattr(
+        cloud.vcenter_tag_category,
+        "get",
+        lambda opts, category_id: {
+            "name": "Environment",
+            "cardinality": "SINGLE",
+        },
+    )
+    monkeypatch.setattr(
+        cloud.vcenter_tag,
+        "list_assigned",
+        lambda opts, object_type, object_id: ["tag-1"],
+    )
+    monkeypatch.setattr(
+        cloud.vcenter_tag,
+        "get",
+        lambda opts, tag_id: {"name": "Production", "category_id": "cat-env"},
+    )
+
+    assert cloud.show_tags("vm-01", call="action") == {
+        "Environment": {"cardinality": "SINGLE", "tags": ["Production"]}
     }
