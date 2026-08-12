@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from salt.exceptions import SaltClientError
 from salt.exceptions import SaltCloudSystemExit
 
 import saltext.vcf_cloud.clouds.vmware as cloud
@@ -573,6 +574,70 @@ def test_create_clones_configures_and_calls_native_bootstrap(monkeypatch, loader
     show_instance.assert_not_called()
     assert loader_globals.utils["cloud.fire_event"].call_args.kwargs["args"]["minion_id"] == (
         "vm-01.example.test"
+    )
+
+
+@pytest.mark.parametrize(
+    ("wait_result", "warning_fragment"),
+    [
+        (None, "did not return grains.items"),
+        (SaltClientError("master client unavailable"), "could not be queried"),
+    ],
+)
+def test_create_falls_back_to_instance_when_grains_are_unavailable(
+    monkeypatch, loader_globals, wait_result, warning_fragment
+):
+    settings = {
+        "name": "vm-01.example.test",
+        "clonefrom": "ubuntu-template",
+    }
+    source = SimpleNamespace(
+        parent=SimpleNamespace(_moId="group-v42"),
+        datastore=[SimpleNamespace(_moId="datastore-17")],
+    )
+
+    monkeypatch.setattr(
+        cloud,
+        "_cfg",
+        lambda name, vm_, default=None, **kwargs: settings.get(name, default),
+    )
+    monkeypatch.setattr(
+        cloud,
+        "_vm",
+        lambda name, **kwargs: source if name == "ubuntu-template" else None,
+    )
+    monkeypatch.setattr(cloud, "_vcf_opts", lambda: {"connection": "opts"})
+    monkeypatch.setattr(cloud.vim_vm, "clone", MagicMock(return_value="task-clone"))
+    monkeypatch.setattr(cloud.vim_vm_power, "power_on", MagicMock(return_value="task-power"))
+    monkeypatch.setattr(cloud, "_wait_task", MagicMock())
+    monkeypatch.setattr(cloud, "_reconfigure", MagicMock())
+    monkeypatch.setattr(cloud, "_configure_networks", MagicMock())
+    monkeypatch.setattr(cloud, "_configure_disks", MagicMock())
+    monkeypatch.setattr(cloud, "_apply_customization", MagicMock())
+    monkeypatch.setattr(cloud, "_wait_for_ip", lambda *args: "192.0.2.25")
+    wait_for_grains = MagicMock()
+    if isinstance(wait_result, Exception):
+        wait_for_grains.side_effect = wait_result
+    else:
+        wait_for_grains.return_value = wait_result
+    monkeypatch.setattr(cloud, "_wait_for_grains", wait_for_grains)
+    monkeypatch.setattr(cloud, "_minion_id", lambda vm_: "vm-01.example.test")
+    show_instance = MagicMock(return_value={"id": "vm-123", "name": "vm-01.example.test"})
+    monkeypatch.setattr(cloud, "show_instance", show_instance)
+    monkeypatch.setattr(cloud.log, "warning", MagicMock())
+
+    result = cloud.create({"name": "vm-01.example.test", "provider": "lab-vcenter"})
+
+    assert result["id"] == "vm-123"
+    assert warning_fragment in result["Warning"]
+    show_instance.assert_called_once_with("vm-01.example.test", call="action")
+    created_event = loader_globals.utils["cloud.fire_event"].call_args
+    assert created_event.args[2] == "salt/cloud/vm-01.example.test/created"
+    assert created_event.kwargs["args"]["minion_id"] == "vm-01.example.test"
+    assert warning_fragment in created_event.kwargs["args"]["warning"]
+    assert all(
+        call.args[2] != "salt/cloud/vm-01.example.test/deploy_failed"
+        for call in loader_globals.utils["cloud.fire_event"].call_args_list
     )
 
 

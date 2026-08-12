@@ -530,7 +530,7 @@ def _wait_for_grains(vm_, timeout):
             grains = result.get(minion_id) if isinstance(result, dict) else None
             if isinstance(grains, dict) and grains:
                 return grains
-            time.sleep(2)
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
     return None
 
 
@@ -629,7 +629,7 @@ def _fire_event(message, tag, args):
 
 
 def _create_failure(name, vm_, message):
-    """Return a visible create error for a VM that already exists in vCenter."""
+    """Return a visible create error after a VM was created in vCenter."""
     log.error("%s", message)
     failure_args = __utils__["cloud.filter_event"](
         "deploy_failed", vm_, ["name", "profile", "provider", "driver"]
@@ -892,6 +892,8 @@ def create(vm_):
         return {"Error": f"Error creating {name}: {exc}"}
 
     grains = None
+    grains_warning = None
+    deploy_completed = False
     if not template and power_on and deploy:
         address = _wait_for_ip(
             name,
@@ -923,24 +925,43 @@ def create(vm_):
                     f"Salt bootstrap failed for {name!r}: {bootstrap_error!r}",
                 )
 
-        grains = _wait_for_grains(
-            vm_,
-            _cfg("wait_for_minion_timeout", vm_, default=120),
-        )
-        if not grains:
-            return _create_failure(
-                name,
+        deploy_completed = True
+        try:
+            grains = _wait_for_grains(
                 vm_,
-                f"Salt bootstrap completed for {name!r}, but minion {_minion_id(vm_)!r} "
-                "did not return grains.items before wait_for_minion_timeout",
+                _cfg("wait_for_minion_timeout", vm_, default=120),
             )
+        except Exception as exc:  # pylint: disable=broad-except
+            grains_error = exc
+        else:
+            grains_error = None
+        minion_id = (grains.get("id") if isinstance(grains, dict) else None) or _minion_id(vm_)
+        if grains_error is not None:
+            grains_warning = (
+                f"Salt bootstrap completed for {name!r}, but grains.items could not "
+                f"be queried for minion {minion_id!r}: {grains_error}; "
+                "returning instance data"
+            )
+        if not grains:
+            if grains_warning is None:
+                grains_warning = (
+                    f"Salt bootstrap completed for {name!r}, but minion {minion_id!r} "
+                    "did not return grains.items before wait_for_minion_timeout; "
+                    "returning instance data"
+                )
+            log.warning("%s", grains_warning)
 
     data = grains if grains is not None else show_instance(name, call="action")
+    if grains_warning and isinstance(data, dict):
+        data = dict(data)
+        data["Warning"] = grains_warning
 
     created_args = __utils__["cloud.filter_event"](
         "created", vm_, ["name", "profile", "provider", "driver"]
     )
-    if grains is not None:
-        created_args["minion_id"] = grains.get("id") or _minion_id(vm_)
+    if deploy_completed:
+        created_args["minion_id"] = minion_id
+    if grains_warning:
+        created_args["warning"] = grains_warning
     _fire_event("created instance", f"salt/cloud/{name}/created", created_args)
     return data

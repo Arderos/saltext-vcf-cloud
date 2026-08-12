@@ -9,3 +9,6 @@
   bootstrap, destroy, events, cache, and native minion-key lifecycle support.
 - Installation and configuration documentation, unit tests, CI, CodeQL, and
   Trusted Publishing release automation.
+- Complete guest grains as successful deployment output and factual minion IDs
+  in `created` events, with a non-fatal instance-data fallback when the
+  master-side grains query is unavailable or times out.

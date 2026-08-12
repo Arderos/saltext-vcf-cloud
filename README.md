@@ -224,7 +224,7 @@ not support `CustomizeVM_Task` against a template object.
 | `customization` | `true` | Apply guest customization when it can be built |
 | `customization_spec` | none | Existing vCenter customization spec name |
 | `wait_for_ip_timeout` | `1200` | Seconds to wait for a guest IPv4 address |
-| `wait_for_minion_timeout` | `120` | Seconds to wait for the minion to return `grains.items` |
+| `wait_for_minion_timeout` | `120` | Seconds to wait for `grains.items` before returning instance data with a warning |
 | `task_timeout` | provider value | Per-profile vSphere task timeout |
 
 Standard Salt Cloud deployment options such as `ssh_username`, `ssh_password`,
@@ -278,9 +278,14 @@ performs its normal sequence:
 3. Render the selected deployment script and minion configuration.
 4. Pass the generated keys and configuration through the native
    `cloud.bootstrap` utility after the VM has an address.
-5. Wait for the configured minion ID to return `grains.items`; successful
-   create output is the complete guest grains dictionary.
+5. Wait for the configured minion ID to return `grains.items`. When available,
+   create output is the complete guest grains dictionary. If the wait times out
+   or a local master client is unavailable, deployment remains successful and
+   create returns instance data with a `Warning` instead.
 6. Remove the accepted key when Salt Cloud destroys the VM.
+
+Creates that skip bootstrap because `deploy: false`, `power_on: false`, or
+`template: true` is set return normal instance data rather than guest grains.
 
 This is the same lifecycle used by native Salt Cloud providers. Options that
 change Salt's key handling continue to belong to Salt Cloud itself.
@@ -305,9 +310,10 @@ Common causes:
   `wait_for_ip_timeout`. The create result contains an `Error` and emits a
   `deploy_failed` event when no IPv4 address is found or bootstrap reports a
   failure.
-- Bootstrap completes but the minion does not return grains: check the
-  effective `minion.id`, `append_domain`, master address, accepted key, and
-  `wait_for_minion_timeout`.
+- Bootstrap completes but the minion does not return grains: create returns
+  instance data with a `Warning` and still emits the `created` event with the
+  computed `minion_id`. Check the effective `minion.id`, `append_domain`, master
+  address, accepted key, and `wait_for_minion_timeout`.
 - Guest customization fails: confirm the template OS supports vSphere guest
   customization and that NIC order matches the profile.
 
