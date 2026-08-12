@@ -321,6 +321,52 @@ def test_valid_ipv4(address, valid):
     assert cloud._valid_ipv4(address) is valid
 
 
+@pytest.mark.parametrize(
+    ("vm_definition", "expected"),
+    [
+        ({"name": "vm-01", "minion": {}}, "vm-01"),
+        (
+            {"name": "vm-01", "minion": {"append_domain": "example.test"}},
+            "vm-01.example.test",
+        ),
+        (
+            {
+                "name": "vm-01",
+                "minion": {"id": "custom-id", "append_domain": "example.test"},
+            },
+            "custom-id.example.test",
+        ),
+        (
+            {"name": "vm-01", "domain": "example.test", "use_fqdn": True},
+            "vm-01.example.test",
+        ),
+    ],
+)
+def test_minion_id_matches_salt_cloud_key_id(monkeypatch, vm_definition, expected):
+    monkeypatch.setattr(
+        cloud.config,
+        "get_cloud_config_value",
+        lambda name, vm_, opts, default=None: vm_.get(name, default),
+    )
+
+    assert cloud._minion_id(vm_definition) == expected
+
+
+def test_wait_for_grains_uses_full_minion_id(monkeypatch, loader_globals):
+    loader_globals.opts["conf_file"] = "/etc/salt/cloud"
+    grains = {"id": "vm-01.example.test", "os": "Ubuntu", "saltversion": "3008.2"}
+    client = MagicMock()
+    client.cmd.return_value = {"vm-01.example.test": grains}
+    local_client = MagicMock()
+    local_client.return_value.__enter__.return_value = client
+    monkeypatch.setattr(cloud.salt.client, "LocalClient", local_client)
+    monkeypatch.setattr(cloud, "_minion_id", lambda vm_: "vm-01.example.test")
+
+    assert cloud._wait_for_grains({"name": "vm-01"}, timeout=30) == grains
+    local_client.assert_called_once_with(c_path=cloud.os.path.join("/etc/salt", "master"))
+    client.cmd.assert_called_once_with("vm-01.example.test", "grains.items", timeout=10)
+
+
 def test_ip_lists_classifies_and_deduplicates_addresses():
     vm_ref = SimpleNamespace(
         guest=SimpleNamespace(
@@ -488,16 +534,20 @@ def test_create_clones_configures_and_calls_native_bootstrap(monkeypatch, loader
     monkeypatch.setattr(cloud, "_configure_disks", MagicMock())
     monkeypatch.setattr(cloud, "_apply_customization", MagicMock())
     monkeypatch.setattr(cloud, "_wait_for_ip", lambda *args: "192.0.2.25")
-    monkeypatch.setattr(
-        cloud,
-        "show_instance",
-        lambda *args, **kwargs: {"id": "vm-123", "name": "vm-01.example.test"},
-    )
+    guest_grains = {
+        "id": "vm-01.example.test",
+        "os": "Ubuntu",
+        "saltversion": "3008.2",
+    }
+    wait_for_grains = MagicMock(return_value=guest_grains)
+    show_instance = MagicMock()
+    monkeypatch.setattr(cloud, "_wait_for_grains", wait_for_grains)
+    monkeypatch.setattr(cloud, "show_instance", show_instance)
 
     vm_definition = {"name": "vm-01.example.test", "provider": "lab-vcenter"}
     result = cloud.create(vm_definition)
 
-    assert result == {"id": "vm-123", "name": "vm-01.example.test"}
+    assert result == guest_grains
     clone.assert_called_once_with(
         {"connection": "opts"},
         "ubuntu-template",
@@ -519,6 +569,8 @@ def test_create_clones_configures_and_calls_native_bootstrap(monkeypatch, loader
     loader_globals.utils["cloud.bootstrap"].assert_called_once_with(
         vm_definition, loader_globals.opts
     )
+    wait_for_grains.assert_called_once_with(vm_definition, 120)
+    show_instance.assert_not_called()
 
 
 def test_create_returns_error_when_deploy_has_no_ip(monkeypatch, loader_globals):

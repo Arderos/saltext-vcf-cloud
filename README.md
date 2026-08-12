@@ -19,7 +19,8 @@ extension handles the vSphere operations through `saltext.vcf` and pyVmomi.
 - Select folders, datastores, clusters, resource pools, and hosts by name or MoID.
 - Configure CPU, memory, advanced settings, hot-add options, NICs, and disks.
 - Apply a named vCenter customization spec or generate a Linux customization spec.
-- Wait for an address reported by VMware Tools and run the native Salt bootstrap.
+- Wait for an address reported by VMware Tools, run the native Salt bootstrap,
+  and return the new minion's complete grains dictionary.
 - List, inspect, start, stop, reboot, and destroy VMs.
 - Use normal Salt Cloud providers, profiles, maps, events, cache, and key lifecycle.
 
@@ -223,6 +224,7 @@ not support `CustomizeVM_Task` against a template object.
 | `customization` | `true` | Apply guest customization when it can be built |
 | `customization_spec` | none | Existing vCenter customization spec name |
 | `wait_for_ip_timeout` | `1200` | Seconds to wait for a guest IPv4 address |
+| `wait_for_minion_timeout` | `120` | Seconds to wait for the minion to return `grains.items` |
 | `task_timeout` | provider value | Per-profile vSphere task timeout |
 
 Standard Salt Cloud deployment options such as `ssh_username`, `ssh_password`,
@@ -276,7 +278,9 @@ performs its normal sequence:
 3. Render the selected deployment script and minion configuration.
 4. Pass the generated keys and configuration through the native
    `cloud.bootstrap` utility after the VM has an address.
-5. Remove the accepted key when Salt Cloud destroys the VM.
+5. Wait for the configured minion ID to return `grains.items`; successful
+   create output is the complete guest grains dictionary.
+6. Remove the accepted key when Salt Cloud destroys the VM.
 
 This is the same lifecycle used by native Salt Cloud providers. Options that
 change Salt's key handling continue to belong to Salt Cloud itself.
@@ -301,6 +305,9 @@ Common causes:
   `wait_for_ip_timeout`. The create result contains an `Error` and emits a
   `deploy_failed` event when no IPv4 address is found or bootstrap reports a
   failure.
+- Bootstrap completes but the minion does not return grains: check the
+  effective `minion.id`, `append_domain`, master address, accepted key, and
+  `wait_for_minion_timeout`.
 - Guest customization fails: confirm the template OS supports vSphere guest
   customization and that NIC order matches the profile.
 

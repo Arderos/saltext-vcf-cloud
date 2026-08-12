@@ -12,11 +12,13 @@ for generating, pre-accepting, transporting, and removing minion keys.
 
 import ipaddress
 import logging
+import os
 import re
 import socket
 import time
 from urllib.parse import urlparse
 
+import salt.client
 import salt.utils.cloud
 import salt.utils.vmware as salt_vmware
 from salt import config
@@ -499,6 +501,39 @@ def _wait_for_ip(name, timeout):
     return next((address for address in addresses if _valid_ipv4(address)), None)
 
 
+def _minion_id(vm_):
+    """Build the minion ID exactly as Salt Cloud core does before create()."""
+    minion = dict(config.get_cloud_config_value("minion", vm_, __opts__, default={}) or {})
+    minion_id = minion.get("id", vm_["name"])
+    domain = vm_.get("domain")
+    if vm_.get("use_fqdn") and domain:
+        minion["append_domain"] = domain
+    if minion.get("append_domain"):
+        minion_id = ".".join((minion_id, minion["append_domain"]))
+    return minion_id
+
+
+def _wait_for_grains(vm_, timeout):
+    """Wait for the new minion and return its complete grains dictionary."""
+    minion_id = _minion_id(vm_)
+    conf_file = __opts__.get("conf_file", "/etc/salt/cloud")
+    master_config = os.path.join(os.path.dirname(conf_file), "master")
+    deadline = time.monotonic() + float(timeout)
+    with salt.client.LocalClient(c_path=master_config) as client:
+        while time.monotonic() < deadline:
+            remaining = max(1, int(deadline - time.monotonic()))
+            result = client.cmd(
+                minion_id,
+                "grains.items",
+                timeout=min(10, remaining),
+            )
+            grains = result.get(minion_id) if isinstance(result, dict) else None
+            if isinstance(grains, dict) and grains:
+                return grains
+            time.sleep(2)
+    return None
+
+
 def _ip_lists(vm_ref):
     private_ips = []
     public_ips = []
@@ -856,6 +891,7 @@ def create(vm_):
         log.exception("Error creating VMware VM %s", name)
         return {"Error": f"Error creating {name}: {exc}"}
 
+    grains = None
     if not template and power_on and deploy:
         address = _wait_for_ip(
             name,
@@ -887,7 +923,19 @@ def create(vm_):
                     f"Salt bootstrap failed for {name!r}: {bootstrap_error!r}",
                 )
 
-    data = show_instance(name, call="action")
+        grains = _wait_for_grains(
+            vm_,
+            _cfg("wait_for_minion_timeout", vm_, default=120),
+        )
+        if not grains:
+            return _create_failure(
+                name,
+                vm_,
+                f"Salt bootstrap completed for {name!r}, but minion {_minion_id(vm_)!r} "
+                "did not return grains.items before wait_for_minion_timeout",
+            )
+
+    data = grains if grains is not None else show_instance(name, call="action")
 
     created_args = __utils__["cloud.filter_event"](
         "created", vm_, ["name", "profile", "provider", "driver"]
